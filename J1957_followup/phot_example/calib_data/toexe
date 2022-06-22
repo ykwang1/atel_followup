@@ -1,0 +1,7 @@
+./spline_test.awk ztf_zg_c03_q3.out.txt.spline spline_inp1
+./spline_test.awk ztf_zg_c04_q1.out.txt.spline spline_inp2
+./spline_test.awk ztf_zr_c03_q3.out.txt.spline spline_inp3
+./spline_test.awk ztf_zr_c05_q4.out.txt.spline spline_inp4
+./spline_test.awk ztf_zr_c03_q1.out.txt.spline spline_inp5
+./spline_test.awk ztf_zr_c16_q4.out.txt.spline spline_inp6
+./spline_test.awk ztf_zg_c01_q1.out.txt.spline spline_inp7
