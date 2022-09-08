@@ -1,0 +1,517 @@
+#!/usr/bin/env python
+#
+# @file    ztfutil.py
+# @brief   Utilities for ZTF commissioning
+# @author  Matthew Graham
+#
+# <!---------------------------------------------------------------------------
+# Copyright (c) 2017 by the California Institute of Technology.
+# This software is part of the ZTF software system.
+# ---------------------------------------------------------------------------->
+
+import concurrent.futures
+import numpy as np
+from astropy.io import fits
+from astropy.table import Table, vstack
+from bs4 import BeautifulSoup
+import os
+import re
+import requests
+from sklearn.preprocessing import StandardScaler
+import sys
+import tqdm
+import time
+import datetime
+import pickle
+
+#------------------------------------------------------------------
+# GLOBAL PARAMETERS
+#------------------------------------------------------------------
+
+#ZTF_BASEURL = "https://ztfweb.ipac.caltech.edu/ztf/archive"
+ZTF_BASEURL = "https://irsa.ipac.caltech.edu/ibe/data/ztf/products"
+LOGIN_URL = "https://irsa.ipac.caltech.edu/account/signon/login.do"
+FPACK_EXE = "/Users/mjg/Downloads/cfitsio/fpack"
+AUTH = ('USERNAME_FOR_ZTF_DEPOT', 'PASSWORD_FOR_ZTF_DEPOT')
+PWD = ('mjg@caltech.edu', "PWD")
+
+
+#------------------------------------------------------------------
+# METHODS
+#------------------------------------------------------------------
+
+def get_cookie(username, password):
+    """Get a cookie from the IPAC login service
+
+    Parameters
+    ----------
+    username: `str`
+        The IPAC account username
+    password: `str`
+        The IPAC account password
+    """
+    now = datetime.datetime.now()
+    date = now.strftime("%Y%m%d")
+#    cfile = "/home/przemek/.ztf_cookie_%s" % date
+    cfile = "/Users/mjg/.ztf_cookie_%s" % date
+    if not os.path.exists(cfile):
+        url = "%s?josso_cmd=login&josso_username=%s&josso_password=%s" % (LOGIN_URL, username, password)
+        response = requests.get(url)
+        cookies = response.cookies
+        with open(cfile, "wb") as out:
+            pickle.dump(cookies, out)
+    else:
+        file = open(cfile, "rb")
+        cookies = pickle.load(file)
+    return cookies
+
+
+def load_file(url, localdir = "/tmp", auth = PWD):
+    """Load a file from the specified URL and save it locally.
+
+    Parameters
+    ----------
+    url : `str`
+        The URL from which the file is to be downloaded
+    localdir : `str`
+        The local directory to which the file is to be saved
+    auth : tuple
+        A tuple of (username, password) to access the ZTF archive
+    """
+    cookies = get_cookie(auth[0], auth[1])
+    response = requests.get(url, stream = True, cookies = cookies)
+    response.raise_for_status()
+    file = '%s/%s' % (localdir, url[url.rindex('/') + 1:])
+    with open(file, 'wb') as handle:
+        for block in response.iter_content(1024):
+            handle.write(block)
+    return os.stat(file).st_size
+
+
+def get_raw_files(date, datefrac, fieldId, filterId, imgType, localDir):
+    """ Get raw camera image files from the archive
+  
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    localdir: `str`
+        A local directory to store images in
+    """
+    urls = ['%s/raw/%s/%s/%s/ztf_%s%s_%s_%s_c%02d_%s.fits.fz' % (ZTF_BASEURL, date[:4], date[4:], datefrac, date, datefrac, fieldId, filterId, ccd, imgType) for ccd in range(1, 17)]
+    # Use a thread pool to manage downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers = 8) as executor:
+        jobs = {executor.submit(load_file, url, localDir): url for url in urls}
+        for job in concurrent.futures.as_completed(jobs):
+            url = jobs[job]
+            try:
+                data = job.result()
+            except Exception as e:
+                print('%r generated an exception: %s' % (url, e))
+            else:
+                print('File %r is %d bytes' % (url, data))
+
+
+def combine_raw_files(localDir, date, datefrac, fieldId, filterId, imgType, gapX = 462, gapY = 645, fill_value = 0):
+    """ Combine individual raw CCD images into a full frame
+  
+    Parameters
+    ----------
+    localdir : `str`
+        A local directory to store images in
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    gapX : int
+        The separation between CCDs in the x (RA) direction
+    gapY : int
+        The separation between CCDs in the y (Dec) direction
+    fill_value : int
+        The value for pixels in the CCD gaps
+    """
+    ccds = ['%s/ztf_%s%s_%s_%s_c%02d_%s.fits.fz' % (localDir, date, datefrac, fieldId, filterId, ccd, imgType) for ccd in range(1, 17)]
+    outfile = '%s/ztf_%s%s_%s_%s_%s_raw_mosaic.fits' % (localDir, date, datefrac, fieldId, filterId, imgType)
+    rows = []
+    for ccdrow in tqdm.tqdm(range(4)):
+        for qrow in range(2):
+            chunks = []
+            for ccd in range(4): 
+                hdulist = fits.open(ccds[4 * ccdrow + (4 - ccd) - 1])
+                if qrow == 0:
+                    img_data_1 = hdulist[3].data   
+                    img_data_2 = hdulist[4].data
+                else:
+                    img_data_1 = hdulist[2].data
+                    img_data_2 = hdulist[1].data
+                # Z-scale
+                img_data_1 = StandardScaler().fit_transform(img_data_1)
+                img_data_2 = StandardScaler().fit_transform(img_data_2)
+                # Rotate by 180 degrees
+                img_data_1 = np.rot90(img_data_1, 2)
+                img_data_2 = np.rot90(img_data_2, 2)
+                x_gap = np.zeros((img_data_1.shape[0], gapX)) + fill_value
+                chunks.append(np.hstack((img_data_1, img_data_2)))
+            row_data = np.hstack((chunks[0], x_gap, chunks[1], x_gap, chunks[2], x_gap, chunks[3]))
+            rows.append(row_data)
+        if ccdrow < 3: rows.append(np.zeros((gapY, row_data.shape[1])) + fill_value)
+    # Increasing Dec is decreasing y
+    array = np.vstack(rows)
+    fits.writeto(outfile, array, header = fits.getheader(ccds[0], 0), overwrite = True)
+    if os.path.exists("%s.tz" % outfile): os.remove("%s.tz" % outfile)
+    os.system("%s -D -Y %s" % (FPACK_EXE, outfile))
+#    print "%s -D -Y %s" % (FPACK_EXE, outfile)
+
+
+def get_calib_files(date, type, filterId, imgType, localDir):
+    """ Get calibration product files from the archive
+  
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    type : `str`
+        The type of calibration file: 'bias', 'hifreqflat'
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    localdir: `str`
+        A local directory to store images in
+    """
+    urls = ['%s/cal/%s/%s/%s/%s/ccs%02d/q%s/ztf_%s_%s_c%02d_q%s_%s.fits' % (ZTF_BASEURL, date[:4], date[4:], type, filterId, ccd, quad, date, filterId, ccd, quad, type) for ccd in range(1, 17) for quad in range(1, 5)]
+    # Use a thread pool to manage downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers = 8) as executor:
+        jobs = {executor.submit(load_file, url, localDir): url for url in urls}
+        for job in concurrent.futures.as_completed(jobs):
+            url = jobs[job]
+            try:
+                data = job.result()
+            except Exception as e:
+                print('%r generated an exception: %s' % (url, e))
+            else:
+                print('File %r is %d bytes' % (url, data))
+
+
+def get_science_files(date, datefrac, fieldId, filterId, imgType, localDir):
+    """ Get science product files from the archive
+  
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    localdir: `str`
+        A local directory to store images in
+    """
+    urls = ['%s/sci/%s/%s/%s/ztf_%s%s_%s_%s_c%02d_%s_q%s_sciimg.fits' % (ZTF_BASEURL, date[:4], date[4:], datefrac, date, datefrac, fieldId, filterId, ccd, imgType, quad) for ccd in range(1, 17) for quad in range(1, 5)]
+    # Use a thread pool to manage downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers = 8) as executor:
+        jobs = {executor.submit(load_file, url, localDir): url for url in urls}
+        for job in concurrent.futures.as_completed(jobs):
+            url = jobs[job]
+            try:
+                data = job.result()
+            except Exception as e:
+                print('%r generated an exception: %s' % (url, e))
+            else:
+                print('File %r is %d bytes' % (url, data))
+
+
+def combine_science_files(localDir, date, datefrac, fieldId, filterId, imgType, gapX = 462, gapY = 645, fill_value = 0):
+    """ Combine individual science products into a full frame
+  
+    Parameters
+    ----------
+    localdir : `str`
+        A local directory to store images in
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    gapX : int
+        The separation between CCDs in the x (RA) direction
+    gapY : int
+        The separation between CCDs in the y (Dec) direction
+    fill_value : int
+        The value for pixels in the CCD gaps
+    """
+    ccds = ['%s/ztf_%s%s_%s_%s_c%02d_%s_q%s_sciimg.fits' % (localDir, date, datefrac, fieldId, filterId, ccd, imgType, quad) for ccd in range(1, 17) for quad in range(1, 5)]
+    outfile = '%s/ztf_%s%s_%s_%s_%s_sci_mosaic.fits' % (localDir, date, datefrac, fieldId, filterId, imgType)
+    missing = np.zeros((3080, 3072)) + fill_value
+    rows = []
+    for ccdrow in tqdm.tqdm(range(4)):
+        for qrow in range(2):
+            chunks = []
+            for ccd in range(4):
+                id = (4 * ccdrow + (4 - ccd)) * 4 - 2 - qrow
+                if not os.path.exists(ccds[id]):
+                    img_data_1 = missing
+                else:
+                    img_data_1 = fits.getdata(ccds[id])
+                    
+                if not os.path.exists(ccds[id + 1 - 2 * qrow]):
+                    img_data_2 = missing
+                else:
+                    img_data_2 = fits.getdata(ccds[id + 1 - 2 * qrow])
+                # Rotate by 180 degrees
+                img_data_1 = np.rot90(img_data_1, 2)
+                img_data_2 = np.rot90(img_data_2, 2)
+                x_gap = np.zeros((img_data_1.shape[0], gapX)) + fill_value
+                chunks.append(np.hstack((img_data_1, img_data_2)))
+            row_data = np.hstack((chunks[0], x_gap, chunks[1], x_gap, chunks[2], x_gap, chunks[3]))
+            rows.append(row_data)
+        if ccdrow < 3: rows.append(np.zeros((gapY, row_data.shape[1])) + fill_value)
+#    array = np.vstack(rows[: : -1])
+    array = np.vstack(rows)
+    fits.writeto(outfile, array, overwrite = True) # Need a header for WCS
+    os.system("%s -D -Y %s" % (FPACK_EXE, outfile))
+
+
+def get_science_source_files(date, datefrac, fieldId, filterId, imgType, localDir, type = 'psfcat'):
+    """ Get source catalogs produced from science product files from the archive
+  
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    type : `str`
+        The type of catalog file to retrieve (sexcat, psfcat)
+    localdir: `str`
+        A local directory to store images in
+    """
+    urls = ['%s/sci/%s/%s/%s/ztf_%s%s_%s_%s_c%02d_%s_q%s_%s.fits' % (ZTF_BASEURL, date[:4], date[4:], datefrac, date, datefrac, fieldId, filterId, ccd, imgType, quad, type) for ccd in range(1, 17) for quad in range(1, 5)]
+    # Use a thread pool to manage downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers = 8) as executor:
+        jobs = {executor.submit(load_file, url, localDir): url for url in urls}
+        for job in concurrent.futures.as_completed(jobs):
+            url = jobs[job]
+            try:
+                data = job.result()
+            except Exception as e:
+                print('%r generated an exception: %s' % (url, e))
+            else:
+                print('File %r is %d bytes' % (url, data))
+
+
+def combine_science_source_files(localDir, date, datefrac, fieldId, filterId, imgType):
+    """ Combine individual quadrant source catalogs into a single catalog for the full frame
+  
+    Parameters
+    ----------
+    localdir : `str`
+        A local directory to store images in
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    """
+    ccds = ['%s/ztf_%s%s_%s_%s_c%02d_%s_q%s_psfcat.fits' % (localDir, date, datefrac, fieldId, filterId, ccd, imgType, quad) for ccd in range(1, 17) for quad in range(1, 5)]
+    outfile = '%s/ztf_%s%s_%s_%s_%s_sci_psfcat.fits' % (localDir, date, datefrac, fieldId, filterId, imgType)
+    first = Table.read(ccds[0])
+    for ccd in ccds[1:]:
+        if os.path.exists(ccd):
+            next = Table.read(ccd)
+            first = vstack([first, next])
+    first.write(outfile, format = 'fits')
+
+
+    
+def get_fields(date, auth = PWD):
+    """ Get the mapping of field IDs to fractional time of day
+
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    auth : tuple
+        A tuple of (username, password) to access the ZTF archive
+    """
+
+    def get_field(url, cookies):
+        field = ''
+        print(url)
+        r = requests.get(url, stream = True, cookies = cookies)
+        fs = BeautifulSoup(r.text, "lxml")
+        tags = fs.findAll('a')
+        if len(tags) > 5:
+            item = fs.findAll('a')[5].text # Should be first data file in list
+            field = item.split('_')[2]
+        return field
+    
+    url = '%s/sci/%s/%s' % (ZTF_BASEURL, date[:4], date[4:])
+    cookies = get_cookie(auth[0], auth[1])
+    print(url)
+    response = requests.get(url, cookies = cookies)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "lxml")
+    template = re.compile('.*[0-9]{6}\/') # IPAC change of link 02/07/18
+    fracdates = [tag['href'] for tag in soup.findAll('a') if template.match(tag['href'])]
+    fields = {}
+    furls = ['%s/%s' % (url, frac[frac.index('/') + 1:]) for frac in fracdates]
+    pbar = tqdm.tqdm(total = len(furls))
+    # Use a thread pool to manage downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers = 8) as executor:
+        jobs = {executor.submit(get_field, furl, cookies): furl for furl in furls}
+        for job in concurrent.futures.as_completed(jobs):
+            pbar.update(1)
+            url = jobs[job]
+            try:
+                field = job.result()
+            except Exception as e:
+                print('%r generated an exception: %s' % (url, e))
+            else:
+                fields[url[-7: -1]] = field
+#                print fields[url[-7:-1]], field
+    return fields
+
+
+def get_header(date, datefrac, fieldId, filterId, imgType, prodType, ccd, quad, auth = PWD, prod = 'sci'):
+    """ Get FITS file header from the archive
+  
+    Parameters
+    ----------
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    prodType: `str`
+        The product type: sciimg
+    ccd: int
+        The CCD number: 01 - 16
+    quad: int
+        The quadrant number: 1 - 4
+    auth : tuple
+        A tuple of (username, password) to access the ZTF archive
+    """
+    url = '%s/%s/%s/%s/%s/ztf_%s%s_%s_%s_c%02d_%s_q%s_%s.fits' % (ZTF_BASEURL, prod, date[:4], date[4:], datefrac, date, datefrac, fieldId, filterId, ccd, imgType, quad, prodType)
+    cookies = get_cookie(auth[0], auth[1])
+    response = requests.get(url, stream = True, cookies = cookies)
+    if response.status_code != 404:
+        # Read 13k of data to get header 
+        count = 0
+        block = ''
+        for chunk in response.iter_content(1024):
+            if count >= 13:
+                break
+            else:
+                block += chunk
+                count += 1
+        header = fits.Header.fromstring(block)
+        return header
+    else:
+        return None
+    
+#------------------------------------------------------------------
+# TESTS
+#------------------------------------------------------------------
+
+def test():
+#    load_file('https://ztfweb.ipac.caltech.edu/ztf/archive/raw/2017/1014/545914/ztf_20171014545914_000000_dk_c06_d.fits.fz', 'temp')
+#    get_raw_files("20171014", "545914", "000000", "dk", "d", "temp")
+#    combine_raw_files("temp", "20171014", "545914", "000000", "dk", "d")
+#    get_raw_files("20171015", "411956", "000507", "zr", "o", "temp")
+#    combine_raw_files("temp", "20171015", "411956", "000507", "zr", "o")
+#    get_science_files("20171015", "411956", "000507", "zr", "o", "temp")
+#    combine_science_files("temp", "20171015", "504109", "000613", "zr", "o")
+    fields = get_fields('20171117')
+    for f in fields:
+        print(f, fields[f])
+        
+#------------------------------------------------------------------
+# MAIN EXECUTION
+#------------------------------------------------------------------
+
+def run(type, date, datefrac, fieldId, filterId, imgType, localDir):
+    """ Get data produces from the archive and create a mosaic frame
+  
+    Parameters
+    ----------
+    type : `str`
+        The type of data product: "raw", "sci", "cat", "log", "header"
+    date : `str`
+        The UT date of the image: YYYYMMDD
+    datefrac : `str`
+        The fractional time of day of the image
+    fieldId : `str`
+        The 6-digit survey field ID (000000 for calibrations)
+    filterId : `str`
+        The 2-letter filter code
+    imgType : `str`
+        The single letter image type code (o, b, f, c, g, ...)
+    localdir: `str`
+        A local directory to store images in
+    """
+    if type == 'raw':
+        get_raw_files(date, datefrac, fieldId, filterId, imgType, localDir)
+        combine_raw_files(localDir, date, datefrac, fieldId, filterId, imgType)
+    elif type == 'sci':
+        get_science_files(date, datefrac, fieldId, filterId, imgType, localDir)
+        combine_science_files(localDir, date, datefrac, fieldId, filterId, imgType)
+    elif type == 'cat':
+        get_science_source_files(date, datefrac, fieldId, filterId, imgType, localDir)
+#        combine_science_source_files(localDir, date, datefrac, fieldId, filterId, imgType)
+    elif type == 'log':
+        fields = get_fields(date)
+        for f in fields:
+            print(f, fields[f])
+    elif type == 'header':
+        header = get_header(date, datefrac, fieldId, filterId, imgType, 'sciimg', 1, 4)
+        print(header)
+        
+#------------------------------------------------------------------
+# COMMAND LINE EXECUTION
+#------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # python ztfutil.py type date datefrac fieldId filterId imgType localDir
+    # type is 'raw', 'sci', 'cat', 'log', 'header'
+    run(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
+#    test()
